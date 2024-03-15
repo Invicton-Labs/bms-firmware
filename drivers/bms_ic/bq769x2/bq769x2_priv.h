@@ -21,6 +21,7 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/i2c.h>
+#include <zephyr/drivers/spi.h>
 
 /**
  * Writes multiple bytes to bq769x2 IC registers
@@ -50,6 +51,7 @@ typedef int (*bq769x2_read_bytes_t)(const struct device *dev, const uint8_t reg_
 struct bms_ic_bq769x2_config
 {
     struct i2c_dt_spec i2c;
+    struct spi_dt_spec spi;
     struct gpio_dt_spec alert_gpio;
     uint32_t shunt_resistor_uohm;
     uint32_t board_max_current;

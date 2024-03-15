@@ -4,8 +4,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#define DT_DRV_COMPAT ti_bq769x2_i2c
-
 #include "bq769x2_interface.h"
 #include "bq769x2_priv.h"
 #include "bq769x2_registers.h"
@@ -22,6 +20,7 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/i2c.h>
+#include <zephyr/drivers/spi.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/crc.h>
 
@@ -116,6 +115,126 @@ static int bq769x2_read_bytes_i2c(const struct device *dev, const uint8_t reg_ad
     else {
         return i2c_write_read_dt(&config->i2c, &reg_addr, 1, data, num_bytes);
     }
+}
+
+static int bq769x2_read_bytes_spi(const struct device *dev, const uint8_t reg_addr, uint8_t *data,
+                                  const size_t num_bytes)
+{
+    const struct bms_ic_bq769x2_config *config = dev->config;
+
+    if (config->crc_enabled) {
+        if (num_bytes > BQ769X2_DATA_BUFFER_SIZE || num_bytes < 1) {
+            return -EINVAL;
+        }
+
+        // Need one extra TX byte to read the response from the previous one
+        uint8_t num_tx_bytes = num_bytes + 1;
+
+        // Prepare the TX data with CRC
+        uint8_t tx_data[3 * num_tx_bytes];
+        for (uint8_t i = 0; i < num_tx_bytes; i++) {
+            tx_data[i * 3] = reg_addr + i;
+            tx_data[i * 3 + 1] = 0;
+            tx_data[i * 3 + 2] = crc8_ccitt(0, tx_data + i * 3, 2);
+        }
+
+        LOG_HEXDUMP_INF(tx_data, 3 * num_tx_bytes, "Read TX");
+
+        // Prepare the buffers
+        // TODO: try sizeof() and ARRAY_SIZE()
+        const struct spi_buf tx_buf[] = { { .buf = tx_data, .len = 3 * num_tx_bytes } };
+        struct spi_buf_set tx = {
+            .buffers = tx_buf,
+            .count = 1,
+        };
+
+        uint8_t rx_data[3 * num_tx_bytes];
+        const struct spi_buf rx_buf[] = { { .buf = rx_data, .len = 3 * num_tx_bytes } };
+        struct spi_buf_set rx = {
+            .buffers = rx_buf,
+            .count = 1,
+        };
+
+        // Transceive the data
+        int err;
+        err = spi_transceive_dt(&config->spi, &tx, &rx);
+        if (err != 0) {
+            return err;
+        }
+
+        // Verify the CRCs on the returned data
+        // Start at 1 because it has the data at write address 0
+        for (uint8_t i = 1; i < num_tx_bytes; i++) {
+            if (crc8_ccitt(0, rx_data + i * 3, 2) == rx_data[i * 3 + 2]) {
+                data[i - 1] = rx_data[i];
+            }
+            else {
+                return -EIO;
+            }
+        }
+
+        return 0;
+    }
+    else {
+        // TODO: non-CRC version
+        return i2c_write_read_dt(&config->i2c, &reg_addr, 1, data, num_bytes);
+    }
+}
+
+static int bq769x2_write_bytes_spi(const struct device *dev, const uint8_t reg_addr,
+                                   const uint8_t *data, const size_t num_bytes)
+{
+    if (k_is_in_isr()) {
+        /* Prevent SPI transactions from an ISR */
+        return -EWOULDBLOCK;
+    }
+
+    if (num_bytes > 4 || num_bytes < 1) {
+        return -EINVAL;
+    }
+
+    const struct bms_ic_bq769x2_config *config = dev->config;
+    // TODO: check if CRC enabled
+    uint8_t tx_data[3 * num_bytes];
+    for (uint8_t i = 0; i < num_bytes; i++) {
+        // Bit at position 7 is for marking that it's a write operation
+        tx_data[i * 3] = BIT(7) | (reg_addr + i);
+        tx_data[i * 3 + 1] = data[i];
+        tx_data[i * 3 + 2] = crc8_ccitt(0, &tx_data[i * 3], 2);
+    }
+
+    LOG_HEXDUMP_INF(tx_data, 3 * num_bytes, "Write TX");
+    const struct spi_buf buf[] = { { .buf = tx_data, .len = 3 * num_bytes } };
+    struct spi_buf_set tx = {
+        .buffers = buf,
+        .count = ARRAY_SIZE(buf),
+    };
+
+    return spi_write_dt(&config->spi, &tx);
+
+    // uint8_t buf[10] = {
+    //     config->i2c.addr << 1, /* target address for CRC calculation */
+    //     reg_addr,
+    // };
+
+    // if (config->crc_enabled) {
+    //     /* first CRC includes target address and register address */
+    //     buf[2] = data[0];
+    //     buf[3] = crc8_ccitt(0, buf, 3);
+
+    //     /* subsequent CRCs only include the data byte */
+    //     for (int i = 1; i < num_bytes; i++) {
+    //         buf[i * 2 + 2] = data[i];
+    //         buf[i * 2 + 3] = crc8_ccitt(0, &data[i], 1);
+    //     }
+
+    //     return i2c_write_dt(&config->i2c, buf + 1, num_bytes * 2 + 1);
+    // }
+    // else {
+    //     memcpy(buf + 2, data, num_bytes);
+
+    //     return i2c_write_dt(&config->i2c, buf + 1, num_bytes + 1);
+    // }
 }
 
 static int bq769x2_detect_cells(const struct device *dev)
@@ -928,13 +1047,22 @@ static int bq769x2_init(const struct device *dev)
 {
     const struct bms_ic_bq769x2_config *config = dev->config;
 
-    if (!i2c_is_ready_dt(&config->i2c)) {
+    if (config->i2c.bus != NULL && !i2c_is_ready_dt(&config->i2c)) {
         LOG_ERR("I2C device not ready");
+        return -ENODEV;
+    }
+    if (config->spi.bus != NULL && !spi_is_ready_dt(&config->spi)) {
+        LOG_ERR("SPI device not ready");
         return -ENODEV;
     }
 
     /* Datasheet: Start-up time max. 4.3 ms */
     k_sleep(K_TIMEOUT_ABS_MS(5));
+
+    // uint8_t data[] = { 0x01 };
+    // while (true) {
+    //     bq769x2_write_bytes_spi(dev, 0x3E, data, 1);
+    // }
 
     return 0;
 }
@@ -956,12 +1084,53 @@ static const struct bms_ic_driver_api bq769x2_driver_api = {
                  "Devicetree properties shunt-resistor-uohm and board-max-current " \
                  "must be greater than 0 for CONFIG_BMS_IC_CURRENT_MONITORING=y")
 
-#define BQ769X2_INIT(index) \
-    static struct bms_ic_bq769x2_data bq769x2_data_##index = { 0 }; \
+// #define DT_DRV_COMPAT ti_bq769x2_i2c
+// #define BQ769X2_INIT(index) \
+//     static struct bms_ic_bq769x2_data bq769x2_data_##index = { 0 }; \
+//     BQ769X2_ASSERT_CURRENT_MONITORING_PROP_GREATER_ZERO(index, shunt_resistor_uohm); \
+//     BQ769X2_ASSERT_CURRENT_MONITORING_PROP_GREATER_ZERO(index, board_max_current); \
+//     static const struct bms_ic_bq769x2_config bq769x2_config_##index = {                   \
+// 		.i2c = I2C_DT_SPEC_INST_GET(index),                                                \
+//         .spi = {.bus = NULL,},\
+// 		.alert_gpio = GPIO_DT_SPEC_INST_GET(index, alert_gpios),                           \
+// 		.shunt_resistor_uohm = DT_INST_PROP_OR(index, shunt_resistor_uohm, 1000),          \
+// 		.board_max_current = DT_INST_PROP_OR(index, board_max_current, 0),                 \
+// 		.used_cell_channels = DT_INST_PROP(index, used_cell_channels),                     \
+// 		.pin_config =                                                                      \
+// 			{                                                                              \
+// 				DT_INST_PROP_OR(index, cfetoff_pin_config, 0),                             \
+// 				DT_INST_PROP_OR(index, dfetoff_pin_config, 0),                             \
+// 				DT_INST_PROP_OR(index, alert_pin_config, 0),                               \
+// 				DT_INST_PROP_OR(index, ts1_pin_config, 0x07),                              \
+// 				DT_INST_PROP_OR(index, ts2_pin_config, 0),                                 \
+// 				DT_INST_PROP_OR(index, ts3_pin_config, 0),                                 \
+// 				DT_INST_PROP_OR(index, hdq_pin_config, 0),                                 \
+// 				DT_INST_PROP_OR(index, dchg_pin_config, 0),                                \
+// 				DT_INST_PROP_OR(index, ddsg_pin_config, 0),                                \
+// 			},                                                                             \
+// 		.cell_temp_pins = DT_INST_PROP(index, cell_temp_pins),                             \
+// 		.num_cell_temps = DT_INST_PROP_LEN(index, cell_temp_pins),                         \
+// 		.fet_temp_pin = DT_INST_PROP_OR(index, fet_temp_pin, UINT8_MAX),                   \
+// 		.crc_enabled = DT_INST_PROP(index, crc_enabled),                                   \
+// 		.auto_pdsg = DT_INST_PROP(index, auto_pdsg),                                       \
+// 		.reg12_config = DT_INST_PROP(index, reg12_config),                                 \
+// 		.write_bytes = bq769x2_write_bytes_i2c,                                            \
+// 		.read_bytes = bq769x2_read_bytes_i2c,                                              \
+// 	}; \
+//     DEVICE_DT_INST_DEFINE(index, &bq769x2_init, NULL, &bq769x2_data_##index, \
+//                           &bq769x2_config_##index, POST_KERNEL, CONFIG_BMS_IC_INIT_PRIORITY, \
+//                           &bq769x2_driver_api);
+
+// DT_INST_FOREACH_STATUS_OKAY(BQ769X2_INIT)
+
+#define DT_DRV_COMPAT ti_bq769x2_spi
+#define BQ769X2_INIT_SPI(index) \
+    static struct bms_ic_bq769x2_data bq769x2_data_spi_##index = { 0 }; \
     BQ769X2_ASSERT_CURRENT_MONITORING_PROP_GREATER_ZERO(index, shunt_resistor_uohm); \
     BQ769X2_ASSERT_CURRENT_MONITORING_PROP_GREATER_ZERO(index, board_max_current); \
-    static const struct bms_ic_bq769x2_config bq769x2_config_##index = {                   \
-		.i2c = I2C_DT_SPEC_INST_GET(index),                                                \
+    static const struct bms_ic_bq769x2_config bq769x2_config_spi_##index = {               \
+        .i2c = {.bus = NULL,}, \
+		.spi = SPI_DT_SPEC_INST_GET(index, SPI_OP_MODE_MASTER | SPI_TRANSFER_MSB | SPI_WORD_SET(8), 0),\
 		.alert_gpio = GPIO_DT_SPEC_INST_GET(index, alert_gpios),                           \
 		.shunt_resistor_uohm = DT_INST_PROP_OR(index, shunt_resistor_uohm, 1000),          \
 		.board_max_current = DT_INST_PROP_OR(index, board_max_current, 0),                 \
@@ -984,11 +1153,11 @@ static const struct bms_ic_driver_api bq769x2_driver_api = {
 		.crc_enabled = DT_INST_PROP(index, crc_enabled),                                   \
 		.auto_pdsg = DT_INST_PROP(index, auto_pdsg),                                       \
 		.reg12_config = DT_INST_PROP(index, reg12_config),                                 \
-		.write_bytes = bq769x2_write_bytes_i2c,                                            \
-		.read_bytes = bq769x2_read_bytes_i2c,                                              \
+		.write_bytes = bq769x2_write_bytes_spi,                                            \
+		.read_bytes = bq769x2_read_bytes_spi,                                              \
 	}; \
-    DEVICE_DT_INST_DEFINE(index, &bq769x2_init, NULL, &bq769x2_data_##index, \
-                          &bq769x2_config_##index, POST_KERNEL, CONFIG_BMS_IC_INIT_PRIORITY, \
+    DEVICE_DT_INST_DEFINE(index, &bq769x2_init, NULL, &bq769x2_data_spi_##index, \
+                          &bq769x2_config_spi_##index, POST_KERNEL, CONFIG_BMS_IC_INIT_PRIORITY, \
                           &bq769x2_driver_api);
 
-DT_INST_FOREACH_STATUS_OKAY(BQ769X2_INIT)
+DT_INST_FOREACH_STATUS_OKAY(BQ769X2_INIT_SPI)
